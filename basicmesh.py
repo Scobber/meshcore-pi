@@ -13,6 +13,7 @@ from exceptions import *
 from ed25519_wrapper import ED25519_Wrapper
 from dispatch import Dispatch
 from misc import pathstr
+from version import MESHCORE_VERSION, MESHCORE_VERSION_DATE
 
 import logging
 logger = logging.getLogger(__name__)
@@ -35,8 +36,8 @@ class BasicMesh:
         # How this device is identified to the dispatcher; override in subclasses
         self.internalname = "Mesh device"
 
-        self.version = "0.1"
-        self.version_date = time.strftime('%Y-%m-%d')
+        self.version = MESHCORE_VERSION
+        self.version_date = MESHCORE_VERSION_DATE
 
         # Sent messages which are awaiting an ack
         # ackhash => Future()
@@ -77,7 +78,7 @@ class BasicMesh:
     async def rx_anonreq(self, rx_packet):
         return
 
-    async def rx_resposne(self, rx_packet):
+    async def rx_response(self, rx_packet):
         return
 
     async def rx_trace(self, rx_packet):

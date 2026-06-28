@@ -7,7 +7,8 @@ What this is
 This an implementation of the MeshCore protocol in Python, intended to
 run on a Raspberry Pi or other Linux device. It can make use of SX1262
 interfaces such as the Waveshare LoRa HAT or an HT-RA62 connected to SPI
-and GPIO.
+and GPIO, as well as SX1272-based boards such as the Dragino LoRa/GPS HAT
+v1.4.
 
 It can also communicate over ESP-NOW with a suitable WiFi interface (one
 which can be put into "monitor" mode), and for experimenting, it can use
@@ -41,8 +42,8 @@ Then install the following:
 * pyserial_asyncio - serial modules
 * typing-extensions - seems to be needed for recent aiotools
 
-If you have an SX1262 board, you'll need:
-* LoRaRF - SX1262 driver
+If you have an SX126x or SX127x board, you'll need:
+* LoRaRF - SX126x/SX127x driver
 
 If you're using ESP-NOW:
 * scapy - must be 2.5.0, newer versions don't work
@@ -56,8 +57,8 @@ $ pip install scapy==2.5.0
 ### Using LoRa interfaces
 
 The LoRaRF library assumes you're running on a Raspberry Pi. There is
-configuration for a Waveshare LoRa/GNSS HAT in the example config, as
-well as a HT-RA62 wired as follows:
+configuration for a Waveshare LoRa/GNSS HAT and Dragino LoRa/GPS HAT v1.4
+in the example config, as well as a HT-RA62 wired as follows:
 
 | HT-RA62 pin | GPIO |
 |-------------|------|
@@ -70,6 +71,19 @@ well as a HT-RA62 wired as follows:
 | NSS         | 8    |
 
 Other pins (TXEN, RXEN, DIO2, DIO3) are not connected
+
+For SX1272/SX127x radios (for example Dragino LoRa/GPS HAT v1.4), set
+the LoRa interface type to lora and choose the chip family:
+
+```
+[interface.dragino]
+type = "lora"
+chip = "sx1272"
+spi = 0
+cs = 0
+irq = 25
+reset = 22
+```
 
 The LoRaRF library installs RPi.GPIO for GPIO access. Unfortunately, if
 you're running newer versions of Raspberry Pi OS (eg, Bookworm), you'll
@@ -244,6 +258,29 @@ other data, such as the path to the client (if known).
 
 This file is updated every time the contacts list is updated.
 
+Installation and systemd
+------------------------
+
+For a normal Linux install, use the included installer script to copy the
+project to a stable prefix and register a systemd service:
+
+```
+sudo ./install
+sudo systemctl enable --now meshcore.service
+```
+
+You can run `sudo ./install` again later to update an existing deployment
+in place.
+
+The installer places the runtime under `/opt/meshcore-pi`, the config in
+`/etc/meshcore/config.toml`, and the service definition in
+`/etc/systemd/system/meshcore.service`.
+
+Existing config files in `/etc/meshcore` are preserved and not overwritten.
+
+The service runs as the `meshcore` user and uses `/var/lib/meshcore` for
+state and `/var/log/meshcore` for logs.
+
 If you run more than one companion, each must have its own file
 
 ### Channels
@@ -301,8 +338,8 @@ Future improvements
 * Telemetry, both for the companion radio and the sensor device type
 * Ability to modify the config through the app or via CLI messages
 * Support more of the companion radio protocol
-* Find a better SX126x library
-* More interface types than just SX126x
+* Find a better SX126x/SX127x library
+* Support more directly connected LoRa chipsets
 * Look again at the crypto libraries
 
 FAQ
@@ -310,8 +347,8 @@ FAQ
 
 Q. Do I have to run this on a Raspberry Pi?
 
-A. No, though the only supported directly connected interface is the
-   SX126x via SPI and GPIO.
+A. No, though the only supported directly connected interfaces are
+  SX126x and SX127x via SPI and GPIO.
 
 Q. Does it support the GPS functions of the Waveshare LoRa/GNSS HAT?
 
@@ -358,7 +395,7 @@ Interfaces:
 * interface.py - Interface class, which other interfaces should subclass
 * espnow.py - Communicate using ESP-NOW, requires an interface which can
   be put into "monitor" mode
-* lorainterface.py - SX126x LoRa interface
+* lorainterface.py - SX126x/SX127x LoRa interface
 * mockinterface.py - Pretend, read-only interface which will read packets
   from a file
 * companioninterface.py - (Mis)use a companion radio as an interface.

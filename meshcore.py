@@ -118,8 +118,17 @@ for device in device_list:
     name = data.get('name', default=f"{device_type.capitalize()} {hexlify(private_key.public_key[0:4]).decode('utf8')}")
 
     if k is None:
-        logger.info(f"Created private key {hexlify(private_key.private_key).decode()} for {name}")
-        print(f"Created private key: {hexlify(private_key.private_key).decode()}")
+        generated_key = hexlify(private_key.private_key).decode()
+        logger.info(f"Created private key {generated_key} for {name}")
+        print(f"Created private key: {generated_key}")
+
+        try:
+            if data.set('privatekey', generated_key, save=True):
+                logger.info(f"Stored generated private key for device {device} in config")
+            else:
+                logger.warning(f"Unable to persist generated private key for device {device}")
+        except Exception as e:
+            logger.warning(f"Failed to persist generated private key for device {device}: {e}")
     else:
         print("Loaded private key from config")
     print(f"{name}, public key: {hexlify(private_key.public_key).decode()}\n")

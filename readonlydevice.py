@@ -70,8 +70,17 @@ if k is not None:
 private_key = ED25519_Wrapper(k)
 
 if k is None:
-    print("Generated random identity key:", hexlify(private_key.private_key).decode('utf-8'))
-    logger.info(f"Generated random identity key {hexlify(private_key.private_key).decode('utf-8')}")
+    generated_key = hexlify(private_key.private_key).decode('utf-8')
+    print("Generated random identity key:", generated_key)
+    logger.info(f"Generated random identity key {generated_key}")
+
+    try:
+        if config.set('privatekey', generated_key, save=True):
+            logger.info("Stored generated private key in config")
+        else:
+            logger.warning("Unable to persist generated private key to config")
+    except Exception as e:
+        logger.warning(f"Failed to persist generated private key to config: {e}")
 
 print("Identity public key:", hexlify(private_key.public_key).decode('utf-8'))
 

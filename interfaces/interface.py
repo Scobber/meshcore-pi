@@ -39,7 +39,7 @@ def configure_interfaces(config):
                 logger.error(f"Unable to configure interface {i}: {repr(e)}")
                 raise
 
-        if interface_type == "espnow":
+        elif interface_type == "espnow":
             interface_name = data.get("device")
             if interface_name is None:
                 logger.error(f"Missing WiFi device name for {i}")

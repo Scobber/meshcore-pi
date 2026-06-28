@@ -186,7 +186,7 @@ class Room(CLIDevice):
         """
 
         writer_pw = self.config.get('writer.password')
-        writer_keys = self.config.get('writer.pubkeys', [])
+        writer_keys = self.config.get('writer.keys', self.config.get('writer.pubkeys', []))
 
         writerlogin = False
 

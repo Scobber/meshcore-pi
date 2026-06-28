@@ -15,6 +15,13 @@ import groupchannel
 from exceptions import *
 from misc import pad, pathstr, validate_latlon
 from basicmesh import BasicMesh
+from version import (
+    MESHCORE_BUILD_DATE,
+    MESHCORE_FIRMWARE_VER_CODE,
+    MESHCORE_MIN_CLIENT_PROTOCOL_VERSION,
+    MESHCORE_SUPPORTED_PROTOCOL_VERSION,
+    firmware_version_tag,
+)
 
 
 import logging
@@ -22,10 +29,10 @@ logger = logging.getLogger(__name__)
 
 # ------------ Frame Protocol --------------
 
-FIRMWARE_VER_CODE = 5
+FIRMWARE_VER_CODE = MESHCORE_FIRMWARE_VER_CODE
 
-FIRMWARE_BUILD_DATE = "9 May 2025"
-FIRMWARE_VERSION = "v1.6.0"
+FIRMWARE_BUILD_DATE = MESHCORE_BUILD_DATE
+FIRMWARE_VERSION = firmware_version_tag()
 
 CMD_APP_START = 1
 CMD_SEND_TXT_MSG = 2
@@ -166,9 +173,18 @@ class CompanionRadio(BasicMesh):
             raise ValueError(f"Unknown app interface {app_interface_name}")
 
         self.appinterface = CompanionInterface(config.get(app_interface_name, view=True))
+        self.config = config
+
+        self.flood_interval = 0
+        self.last_flood_advert = 0
+        self.direct_interval = 0
+        self.last_direct_advert = 0
 
         # Queue of messages waiting to be delivered to the app
         self.msgqueue = asyncio.Queue()
+
+        # App-side protocol information (separate from meshcore protocol versioning).
+        self.client_protocol_version = 0
 
         # Hash of message ackhash vs time
         # Records the time a message was sent, in order to work out the round trip time
@@ -184,6 +200,57 @@ class CompanionRadio(BasicMesh):
         self.pending_telemetry = None   # Target we sent a telemetry request to
         self.pending_discovery = None   # Target we sent a discovery request to
         self.pending_req = None         # Target we sent a binary request to
+
+    async def tx_advert_flood(self):
+        # Interval between flood adverts, -1 = disabled, 0 = once at startup, >0 = repeat in hours
+        flood_interval = self.config.get('advert.flood', -1)
+        if flood_interval >= 0:
+            self.flood_interval = flood_interval * 60 * 60
+        else:
+            self.flood_interval = 0
+            logger.debug("Companion flood adverts disabled")
+            return
+
+        while True:
+            await self.tx_advert(flood=True)
+            self.last_flood_advert = time.time()
+            logger.debug("Companion scheduled flood advert sent")
+
+            if self.flood_interval == 0:
+                break
+
+            await asyncio.sleep(self.flood_interval)
+
+    async def tx_advert_direct(self):
+        # Interval between direct adverts, -1 = disabled, 0 = once at startup, >0 = repeat in minutes
+        direct_interval = self.config.get('advert.direct', 0)
+        if direct_interval >= 0:
+            self.direct_interval = direct_interval * 60
+        else:
+            self.direct_interval = 0
+            logger.debug("Companion direct adverts disabled")
+            return
+
+        await asyncio.sleep(2)
+
+        while True:
+            now = time.time()
+            next_flood = self.last_flood_advert + self.flood_interval
+
+            if (self.last_flood_advert + 120) > now or (
+                (next_flood > now) and ((next_flood - 120) < now) or
+                (next_flood < now) and self.flood_interval > 0
+            ):
+                logger.debug("Companion direct advert skipped to avoid flood clash")
+            else:
+                await self.tx_advert(flood=False)
+                self.last_direct_advert = now
+                logger.debug("Companion scheduled direct advert sent")
+
+            if self.direct_interval == 0:
+                break
+
+            await asyncio.sleep(self.direct_interval)
 
 
     # Clean up the messagetime hash - delete the entry from the hash table after delay seconds
@@ -519,6 +586,23 @@ class CompanionRadio(BasicMesh):
         # Return RESP_CODE_SENT with 4 bytes of the packet timestamp as the tag
         return sent_resp(statusreq, struct.pack("<L", statusreq.timestamp))
 
+    # Send telemetry request to repeater, room server, etc
+    async def send_telemetry_req(self, pubkey):
+        dest = self.ids.find_by_pubkey(pubkey)
+        if dest is None:
+            return ERR(ERR_CODE_NOT_FOUND)
+
+        # Request data follows the same envelope used by status requests.
+        data = bytes(4) + randbytes(4)
+
+        telemetry_req = packet.MC_Req_Out(self.me, dest, packet.MC_Packet.REQ_TYPE_GET_TELEMETRY_DATA, data)
+
+        # Store the fact that we're waiting for this device to respond.
+        self.pending_telemetry = dest.pubkey
+
+        await self.transmit_packet(telemetry_req)
+        return sent_resp(telemetry_req, struct.pack("<L", telemetry_req.timestamp))
+
 
     async def rx_response(self, packet:packet.MC_SrcDest):
         # Packet is either a MC_Response or an MC_Path. Either will contain a
@@ -571,16 +655,39 @@ class CompanionRadio(BasicMesh):
             logger.info("Sending PUSH_CODE_STATUS_RESPONSE to app")
             await self.appinterface.tx(msg)
 
+        elif self.pending_telemetry and self.pending_telemetry == packet.source.pubkey:
+            logger.debug("Received pending telemetry response")
+            self.pending_telemetry = None
+
+            # Send to client
+            #   PUSH_CODE_TELEMETRY_RESPONSE
+            #   0 (reserved)
+            #   First 6 bytes of responding endpoint pubkey
+            #   Telemetry data as received (everything after first 4 bytes of response)
+            msg = bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + packet.source.pubkey[0:6] + frame[4:]
+
+            logger.info("Sending PUSH_CODE_TELEMETRY_RESPONSE to app")
+            await self.appinterface.tx(msg)
+
         else:
             logger.warning("Unexpected response received")
 
     # Send TRACE packet - used for ping and path trace operations
     async def send_trace(self, tag, auth, flags, path):
+        if len(path) < 1:
+            logger.warning("Trace path too short")
+            return ERR(ERR_CODE_UNSUPPORTED_CMD)
+
         if len(path)>64:
             logger.warning("Trace path too long")
             return ERR(ERR_CODE_UNSUPPORTED_CMD)
 
-        trace = packet.MC_Trace_Out(path, tag, auth, flags)
+        try:
+            trace = packet.MC_Trace_Out(path, tag, auth, flags)
+        except ValueError as e:
+            logger.warning(f"Invalid trace request: {e}")
+            return ERR(ERR_CODE_ILLEGAL_ARG)
+
         await self.transmit_packet(trace)
 
         return sent_resp(trace, tag)
@@ -802,6 +909,33 @@ class CompanionRadio(BasicMesh):
                 # FIXME - don't just ignore this
                 response = OK
 
+            elif command == CMD_SET_TUNING_PARAMS:
+                logger.debug(f"CMD_SET_TUNING_PARAMS, {hexlify(frame[1:]).decode()}")
+
+                # Region pane uses tuning params. Persist raw payload so reads can
+                # be round-tripped even when we do not fully decode all fields yet.
+                self.config.set('radio.tuning.raw', hexlify(frame[1:]).decode(), save=True)
+                response = OK
+
+            elif command == CMD_GET_CUSTOM_VARS:
+                logger.debug("CMD_GET_CUSTOM_VARS")
+
+                raw = self.config.get('custom.vars.raw', '')
+                try:
+                    payload = unhexlify(raw) if raw else bytes()
+                except Exception:
+                    logger.warning("Invalid custom.vars.raw value in config; returning empty")
+                    payload = bytes()
+
+                response = bytes([RESP_CODE_CUSTOM_VARS]) + payload
+
+            elif command == CMD_SET_CUSTOM_VAR:
+                logger.debug(f"CMD_SET_CUSTOM_VAR, {hexlify(frame[1:]).decode()}")
+
+                # Preserve opaque custom-var payload for later CMD_GET_CUSTOM_VARS.
+                self.config.set('custom.vars.raw', hexlify(frame[1:]).decode(), save=True)
+                response = OK
+
 
             elif command == CMD_SYNC_NEXT_MESSAGE:
                 logger.debug("CMD_SYNC_NEXT_MESSAGE")
@@ -850,12 +984,20 @@ class CompanionRadio(BasicMesh):
 
             elif command == CMD_DEVICE_QUERY:
                 # Respond with device results
-                self.app_protocol_version = frame[1]
+                self.client_protocol_version = frame[1]
                 
-                logger.debug(f"CMD_DEVICE_QUERY, app protocol version:{self.app_protocol_version}")
+                logger.debug(
+                    "CMD_DEVICE_QUERY, client protocol version=%s, supported protocol version=%s",
+                    self.client_protocol_version,
+                    MESHCORE_SUPPORTED_PROTOCOL_VERSION,
+                )
 
-                if self.app_protocol_version <3:
-                    logger.error("Protocol version < 3 not supported")
+                if self.client_protocol_version < MESHCORE_MIN_CLIENT_PROTOCOL_VERSION:
+                    logger.error(
+                        "Client protocol version %s is below minimum supported %s",
+                        self.client_protocol_version,
+                        MESHCORE_MIN_CLIENT_PROTOCOL_VERSION,
+                    )
                     break
 
                 # We haven't really defined the maximum number of contacts.
@@ -940,6 +1082,17 @@ class CompanionRadio(BasicMesh):
                     logger.debug(f"CMD_SEND_STATUS_REQ, to: {hexlify(pubkey).decode()}")
                     response = await self.send_status_req(pubkey)
 
+            elif command == CMD_SEND_TELEMETRY_REQ:
+                # Get telemetry from remote device
+                # - device public key (32 bytes)
+                if len(frame) < 33:
+                    # Need at least the command code (CMD_SEND_TELEMETRY_REQ) and pubkey
+                    response = ERR(ERR_CODE_NOT_FOUND)
+                else:
+                    pubkey = frame[1:33]
+                    logger.debug(f"CMD_SEND_TELEMETRY_REQ, to: {hexlify(pubkey).decode()}")
+                    response = await self.send_telemetry_req(pubkey)
+
 
             elif command == CMD_SEND_TRACE_PATH:
                 # Send a trace
@@ -949,17 +1102,17 @@ class CompanionRadio(BasicMesh):
                 #    flags (1 byte) - currently all zeroes
                 #    path (remaining bytes)
                 if len(frame) < 10:
-                    logger.warnimg("Data frame too short")
-                    return ERR(ERR_CODE_UNSUPPORTED_CMD)
+                    logger.warning("Data frame too short")
+                    response = ERR(ERR_CODE_UNSUPPORTED_CMD)
+                else:
+                    tag = frame[1:5]
+                    auth = frame[5:9]
+                    flags = frame[9]
+                    path = frame[10:]
 
-                tag = frame[1:5]
-                auth = frame[5:9]
-                flags = frame[9]
-                path = frame[10:]
+                    logger.debug(f"CMD_SEND_TRACE_PATH: tag=0x{hexlify(tag).decode()}, auth=0x{hexlify(auth).decode()}, flags={flags}, path={pathstr(path)}")
 
-                logger.debug(f"CMD_SEND_TRACE_PATH: tag=0x{hexlify(tag).decode()}, auth=0x{hexlify(auth).decode()}, flags={flags}, path={pathstr(path)}")
-
-                response = await self.send_trace(tag, auth, flags, path)
+                    response = await self.send_trace(tag, auth, flags, path)
 
             elif command == CMD_GET_ADVERT_PATH:
                 # frame[1] is a reserved byte
@@ -992,6 +1145,9 @@ class CompanionRadio(BasicMesh):
     async def start(self):
         # Start the mesh
         await super().start()
+
+        current_taskgroup.get().create_task(self.tx_advert_flood(), name="Companion flood advert task")
+        current_taskgroup.get().create_task(self.tx_advert_direct(), name="Companion direct advert task")
 
         # Start the main task
         current_taskgroup.get().create_task(self.run(), name="Companion radio main")

@@ -9,10 +9,25 @@ from collections import deque
 from .interface import Interface
 from configuration import ConfigView, get_config
 
-from LoRaRF import SX126x
+from LoRaRF import SX126x, SX127x
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+def _release_reset_pin(pin):
+    # Best-effort reset line release for Pi GPIO stacks (RPi.GPIO or rpi-lgpio shim).
+    if pin is None or pin < 0:
+        return
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.HIGH)
+        time.sleep(0.01)
+        GPIO.cleanup(pin)
+    except Exception as e:
+        logger.debug(f"Could not release reset pin GPIO{pin}: {e}")
 
 # DIO3 TCXO control settings
 # SetDio3AsTcxoCtrl
@@ -52,21 +67,55 @@ class LoRaInterface(Interface):
     """
     def __init__(self, config:ConfigView):
         super().__init__() 
-        self._name = "SX126x device interface"
+
+        chip_name = config.get("chip", "sx126x")
+        chip = chip_name.lower().replace("-", "")
+        chip_aliases = {
+            "sx1261": "sx126x",
+            "sx1262": "sx126x",
+            "sx1268": "sx126x",
+            "llcc68": "sx126x",
+            "sx126x": "sx126x",
+            "sx1272": "sx127x",
+            "sx1276": "sx127x",
+            "sx1277": "sx127x",
+            "sx1278": "sx127x",
+            "sx1279": "sx127x",
+            "sx127x": "sx127x"
+        }
+        chip_family = chip_aliases.get(chip, None)
+
+        if chip_family is None:
+            raise ValueError(f"Unsupported LoRa chip '{chip_name}'. Supported values: sx126x or sx127x family")
+
+        self.is_sx127x = chip_family == "sx127x"
+        self._name = "SX127x device interface" if self.is_sx127x else "SX126x device interface"
 
         # Flag to signal when data has been transmitted
         self.txdone = asyncio.Event()
         # Last transmit duration (ms)
         self.txtime = 0
+        self._last_status = None
+        self._tx_wait_since = None
 
         # Fetch all the config we need
         # Default config is UK/EU Narrow
-        config.set_default(get_config({
-            "frequency": 869618000, "sf": 8, "bw":62500, "cr":8,
-            "txpower":22, "airtime": 10,
-            # WaveShare SX1262 HAT for Raspberry Pi
-            "spi":0, "cs": 0, "irq":16, "busy":20, "reset":18, "txen": 6
-        }))
+        if self.is_sx127x:
+            # Dragino LoRa/GPS HAT v1.4 defaults (SX1272)
+            config.set_default(get_config({
+                "chip": "sx1272",
+                "frequency": 916575000, "sf": 7, "bw":62500, "cr":8,
+                "txpower":17, "airtime": 10,
+                "spi":0, "cs": 2, "irq":-1, "reset":22, "txen": -1, "rxen": -1
+            }))
+        else:
+            config.set_default(get_config({
+                "chip": "sx1262",
+                "frequency": 869618000, "sf": 8, "bw":62500, "cr":8,
+                "txpower":22, "airtime": 10,
+                # WaveShare SX1262 HAT for Raspberry Pi
+                "spi":0, "cs": 0, "irq":16, "busy":20, "reset":18, "txen": 6
+            }))
 
         self.freq = config.get("frequency")
         self.sf = config.get("sf")
@@ -74,49 +123,120 @@ class LoRaInterface(Interface):
         self.cr = config.get("cr")
         self.txpower = config.get("txpower")
         airtime = config.get("airtime", 10)
+        self.debug = config.get("debug", False)
 
         spi = config.get("spi")
         cs = config.get("cs")
         irq = config.get("irq")
+        self.irq = irq
         busy = config.get("busy")
         reset = config.get("reset")
         txen = config.get("txen", -1)
         rxen = config.get("rxen", -1)
         wake = config.get("wake", -1)
 
+        if self.is_sx127x and reset in (7, 8, 9, 10, 11):
+            raise ValueError(
+                f"Invalid SX127x reset GPIO{reset}: this pin is reserved for SPI bus signals. "
+                "Choose a dedicated GPIO (for Dragino SX1272, use reset=22)."
+            )
+
         dio3_voltage = config.get("dio3.voltage", None)
         dio3_txco_delay = config.get("dio3.tcxo_delay", None)
 
         dio2_rfswitch = config.get("dio2.rfswitch", False)
 
+        if self.debug:
+            logger.warning(
+                "LoRa debug enabled: chip=%s spi=%s cs=%s irq=%s reset=%s busy=%s txen=%s rxen=%s wake=%s freq=%s sf=%s bw=%s cr=%s",
+                chip_name, spi, cs, irq, reset, busy, txen, rxen, wake, self.freq, self.sf, self.bw, self.cr
+            )
+
         if (dio3_voltage is not None and dio3_txco_delay is None) or (dio3_voltage is None and dio3_txco_delay is not None):
             raise ValueError("Both dio3.voltage and dio3.tcxo_delay must be set to enable DIO3 control")
 
-        self.LoRa = SX126x()
+        try:
+            if self.is_sx127x:
+                _release_reset_pin(reset)
+                self.LoRa = SX127x()
+                try:
+                    started = self.LoRa.begin(spi, cs, reset, irq, txen, rxen)
+                except TypeError:
+                    # Compatibility with LoRaRF versions that do not expose txen/rxen in begin().
+                    started = self.LoRa.begin(spi, cs, reset, irq)
 
-        if not self.LoRa.begin(spi, cs, reset, busy, irq, txen, rxen, wake):
-            logger.error("LoRa interface did not start")
-            # FIXME - need a better exception
-            raise ValueError("LoRa interface did not start")
+                # Some LoRaRF builds treat disabled txen/rxen pins poorly when passed as -1.
+                # Retry with the plain 4-argument signature before giving up.
+                if not started and txen == -1 and rxen == -1:
+                    logger.warning("SX127x init failed with txen/rxen disabled; retrying without txen/rxen arguments")
+                    started = self.LoRa.begin(spi, cs, reset, irq)
+
+                # Some Pi/GPIO stacks fail to attach IRQ edge detection at init.
+                # Retry in polling mode so radio startup still succeeds.
+                if not started and irq is not None and irq >= 0:
+                    logger.warning(f"SX127x init failed on IRQ GPIO{irq}; retrying with polling (irq=-1)")
+                    self.irq = -1
+                    try:
+                        started = self.LoRa.begin(spi, cs, reset, -1, txen, rxen)
+                    except TypeError:
+                        started = self.LoRa.begin(spi, cs, reset, -1)
+
+                    if not started and txen == -1 and rxen == -1:
+                        logger.warning("SX127x polling init failed with txen/rxen disabled; retrying without txen/rxen arguments")
+                        started = self.LoRa.begin(spi, cs, reset, -1)
+            else:
+                self.LoRa = SX126x()
+                started = self.LoRa.begin(spi, cs, reset, busy, irq, txen, rxen, wake)
+        except FileNotFoundError as e:
+            spidev = f"/dev/spidev{spi}.{cs}"
+            raise ValueError(
+                f"SPI device {spidev} is not available. "
+                "Enable SPI in the OS and verify LoRa interface 'spi'/'cs' config values."
+            ) from e
+
+        if not started:
+            _release_reset_pin(reset)
+            msg = (
+                "LoRa interface did not start. "
+                f"chip={chip_name} spi={spi} cs={cs} irq={self.irq} reset={reset} "
+                f"freq={self.freq} sf={self.sf} bw={self.bw} cr={self.cr}. "
+                "Verify spidev node exists, pin mapping, and radio params. "
+                "For SX127x on unstable GPIO IRQ systems, set irq=-1."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
 
         self.LoRa.setFrequency(self.freq)
-        self.LoRa.setTxPower(self.txpower)
-        self.LoRa.setRxGain(self.LoRa.RX_GAIN_BOOSTED)
+        if self.is_sx127x:
+            self.LoRa.setTxPower(self.txpower, self.LoRa.TX_POWER_PA_BOOST)
+            self.LoRa.setRxGain(self.LoRa.RX_GAIN_BOOSTED, self.LoRa.RX_GAIN_AUTO)
+            self.max_txpower = 20
+        else:
+            self.LoRa.setTxPower(self.txpower)
+            self.LoRa.setRxGain(self.LoRa.RX_GAIN_BOOSTED)
+            self.max_txpower = 27
+
         # SF, BW, CR, LDRO (low data rate optimization; off)
         self.LoRa.setLoRaModulation(self.sf, self.bw, self.cr, False)
 
         # DIO3 as TCXO control (optional)
-        if dio3_voltage is not None:
-            d3v = DIO3_VOLTAGE.get(dio3_voltage, None)
-            d3t = TCXO_DELAY.get(dio3_txco_delay, None)
-            if d3v is None or d3t is None:
-                raise ValueError("Invalid dio3.voltage or dio3.tcxo_delay value")
+        if self.is_sx127x:
+            if dio3_voltage is not None:
+                logger.warning("Ignoring dio3.* settings for SX127x interface")
+            if dio2_rfswitch:
+                logger.warning("Ignoring dio2.rfswitch setting for SX127x interface")
+        else:
+            if dio3_voltage is not None:
+                d3v = DIO3_VOLTAGE.get(dio3_voltage, None)
+                d3t = TCXO_DELAY.get(dio3_txco_delay, None)
+                if d3v is None or d3t is None:
+                    raise ValueError("Invalid dio3.voltage or dio3.tcxo_delay value")
 
-            self.LoRa.setDio3TcxoCtrl(d3v, d3t)
+                self.LoRa.setDio3TcxoCtrl(d3v, d3t)
 
-        # DIO2 as RF switch control (optional)
-        if dio2_rfswitch:
-            self.LoRa.setDio2RfSwitch(True)
+            # DIO2 as RF switch control (optional)
+            if dio2_rfswitch:
+                self.LoRa.setDio2RfSwitch(True)
 
         self.LoRa.setLoRaPacket(self.LoRa.HEADER_EXPLICIT, 16, 255, True, False)
         self.LoRa.setSyncWord(0x12)
@@ -126,7 +246,25 @@ class LoRaInterface(Interface):
         self.airtime_txtimestamp = deque([0,0,0,0,0], maxlen=5)
         self.airtime_txtime = deque([0,0,0,0,0], maxlen=5)
 
-        logger.debug(f"Configired LoRa interface on SPI{spi}:{cs} for {self.freq/1000000:0.3f}MHz, BW: {self.bw/1000}KHz, SF: {self.sf}, CR: {self.cr}")
+        logger.debug(f"Configured {chip_name} LoRa interface on SPI{spi}:{cs} for {self.freq/1000000:0.3f}MHz, BW: {self.bw/1000}KHz, SF: {self.sf}, CR: {self.cr}")
+
+    def _fallback_to_polling(self):
+        # LoRaRF SX127x can fail edge detection on some Pi/GPIO stacks.
+        if self.is_sx127x and self.irq is not None and self.irq >= 0:
+            logger.warning("SX127x IRQ edge detection failed; falling back to polling mode")
+            self.irq = -1
+            if hasattr(self.LoRa, "_irq"):
+                self.LoRa._irq = None
+
+    def _request_rx_continuous(self):
+        try:
+            self.LoRa.request(self.LoRa.RX_CONTINUOUS)
+        except RuntimeError as e:
+            if self.is_sx127x and "edge detection" in str(e).lower():
+                self._fallback_to_polling()
+                self.LoRa.request(self.LoRa.RX_CONTINUOUS)
+            else:
+                raise
 
     # Receive thread
     #
@@ -136,14 +274,33 @@ class LoRaInterface(Interface):
     def rx_thread(self):
         logger.debug("LoRa rx thread listening")
 
-        self.LoRa.request(self.LoRa.RX_CONTINUOUS)
+        self._request_rx_continuous()
     
         s = ["STATUS_DEFAULT", "STATUS_TX_WAIT", "STATUS_TX_TIMEOUT", "STATUS_TX_DONE", "STATUS_RX_WAIT", "STATUS_RX_CONTINUOUS", "STATUS_RX_TIMEOUT", "STATUS_RX_DONE", "STATUS_HEADER_ERR", "STATUS_CRC_ERR", "STATUS_CAD_WAIT", "STATUS_CAD_DETECTED", "STATUS_CAD_DONE"]
         while True:
-            self.LoRa.wait()
+            if self.is_sx127x and self.irq is not None and self.irq < 0:
+                # Polling mode: LoRaRF wait() polls IRQ flags via SPI when irq == -1.
+                # This updates internal status and RX buffer pointers for status()/available()/read().
+                self.LoRa.wait(timeout=0.05)
+            else:
+                self.LoRa.wait()
 
             status = self.LoRa.status()
-            logger.debug(f"Status: {s[status]}")
+            if status != self._last_status:
+                logger.debug(f"Status: {s[status]}")
+                self._last_status = status
+
+            if self.is_sx127x and self.irq is not None and self.irq < 0 and status == self.LoRa.STATUS_TX_WAIT:
+                now = time.time()
+                if self._tx_wait_since is None:
+                    self._tx_wait_since = now
+                elif now - self._tx_wait_since > 2.0:
+                    logger.warning("SX127x stuck in TX_WAIT; forcing RX_CONTINUOUS recovery")
+                    self._request_rx_continuous()
+                    self._tx_wait_since = None
+                continue
+            else:
+                self._tx_wait_since = None
 
             if status == self.LoRa.STATUS_RX_DONE:
                 logger.debug(f"Packet received, {self.LoRa.available()} bytes")
@@ -158,19 +315,37 @@ class LoRaInterface(Interface):
 
                 self.eventloop.call_soon_threadsafe(self.rx_q.put_nowait, (data,rssi,snr))
                 logger.debug(f"Packet data, {hexlify(data).decode()}")
+                if self.is_sx127x and self.irq is not None and self.irq < 0:
+                    self._request_rx_continuous()
                 continue
 
             elif status == self.LoRa.STATUS_CRC_ERR:
                 logger.info("RX packet CRC error")
+                if self.is_sx127x and self.irq is not None and self.irq < 0:
+                    self._request_rx_continuous()
                 continue
             elif status == self.LoRa.STATUS_HEADER_ERR:
                 logger.info("RX packet header error")
+                if self.is_sx127x and self.irq is not None and self.irq < 0:
+                    self._request_rx_continuous()
                 continue
 
             elif status == self.LoRa.STATUS_TX_DONE:
                 self.eventloop.call_soon_threadsafe(self.tx_done, self.LoRa.transmitTime())
+                # SX127x behaves better if RX_CONTINUOUS is only requested after TX completes.
+                if self.is_sx127x:
+                    self._request_rx_continuous()
 
-            self.LoRa.request(self.LoRa.RX_CONTINUOUS)
+            # SX126x path expects an explicit re-request after each status transition.
+            if not self.is_sx127x:
+                self._request_rx_continuous()
+            elif self.irq is not None and self.irq < 0 and status in (
+                self.LoRa.STATUS_DEFAULT,
+                self.LoRa.STATUS_RX_TIMEOUT,
+            ):
+                # In polling mode, only re-arm on idle/timeout states.
+                # Re-requesting during RX_CONTINUOUS can reset demodulation mid-packet.
+                self._request_rx_continuous()
 
     # FIXME race condition here - what is the proper timeout for a transmission?
     def tx_done(self, tx_time):
@@ -217,7 +392,14 @@ class LoRaInterface(Interface):
 
         self.LoRa.beginPacket()
         self.LoRa.put(packetdata)
-        self.LoRa.endPacket()
+        try:
+            self.LoRa.endPacket()
+        except RuntimeError as e:
+            if self.is_sx127x and "edge detection" in str(e).lower():
+                self._fallback_to_polling()
+                self.LoRa.endPacket()
+            else:
+                raise
 
         try:
             await asyncio.wait_for(self.txdone.wait(), 5)
@@ -229,6 +411,13 @@ class LoRaInterface(Interface):
 
         except TimeoutError:
             logger.debug("Transmit timed out")
+            # In SX127x polling mode, status can stick in TX_WAIT and leave RX stalled.
+            # Force the receiver back to continuous mode so inbound responses can be heard.
+            if self.is_sx127x and self.irq is not None and self.irq < 0:
+                try:
+                    self._request_rx_continuous()
+                except Exception as e:
+                    logger.warning(f"Failed to re-arm RX after TX timeout: {e}")
     
         self.txdone.clear()
         return self.txtime
@@ -236,7 +425,7 @@ class LoRaInterface(Interface):
     # Return a tuple containing frequency (kHz), bandwidth (Hz), spreading factor, coding rate,
     # tx power (dBm), maximum tx power (dBm)
     def get_radioconfig(self):
-        return (self.freq//1000, self.bw, self.sf, self.cr, self.txpower, 27)
+        return (self.freq//1000, self.bw, self.sf, self.cr, self.txpower, self.max_txpower)
 
     async def start(self):
         self.eventloop = asyncio.get_running_loop()

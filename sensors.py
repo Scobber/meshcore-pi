@@ -10,3 +10,7 @@ class HardwarePlatform:
     def batterymillivolts(self):
         # There is no battery, make up a number
         return 0xffff
+
+    def noisefloordbm(self):
+        # Default fallback when a platform does not provide a measured value.
+        return -120
