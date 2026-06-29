@@ -10,7 +10,7 @@ from random import randbytes
 from binascii import unhexlify, hexlify
 
 import packet
-from identity import AdvertType
+from identity import AdvertData, AdvertDataFlags, AdvertType, AnonIdentity, Identity
 import groupchannel
 from exceptions import *
 from misc import pad, pathstr, validate_latlon
@@ -76,6 +76,16 @@ CMD_SEND_TELEMETRY_REQ = 39
 CMD_GET_CUSTOM_VARS = 40
 CMD_SET_CUSTOM_VAR = 41
 CMD_GET_ADVERT_PATH = 42
+CMD_SEND_PATH_DISCOVERY_REQ = 52
+
+# v8+ command names from MeshCore protocol docs/source.
+CMD_SET_FLOOD_SCOPE_KEY = 54
+CMD_SEND_CONTROL_DATA = 55
+
+# Newer companion clients issue these command IDs during discovery/repeater flows.
+# Keep compatibility by acknowledging and returning a usable response shape.
+CMD_DISCOVERY_FLOW = CMD_SET_FLOOD_SCOPE_KEY
+CMD_REPEATER_FLOW = CMD_SEND_CONTROL_DATA
 
 RESP_CODE_OK = 0
 RESP_CODE_ERR = 1
@@ -280,6 +290,25 @@ class CompanionRadio(BasicMesh):
         """
         Send PUSH_CODE_LOG_RX_DATA, to inform the client that there is a new packet
         """
+        # Reliability improvement: learn sender pubkeys seen in ANON_REQ traffic.
+        # TXT/REQ payloads only carry 1-byte source hashes, so if we don't already
+        # know a sender's pubkey we cannot derive the shared secret to decrypt.
+        # ANON_REQ frames include the full sender pubkey, even when addressed to a
+        # different local device (eg, the repeater), so cache it here for later.
+        if isinstance(rx_packet, packet.MC_AnonReq):
+            sender = self.ids.find_by_pubkey(rx_packet.senderpubkey)
+            if sender is None:
+                try:
+                    anon = AnonIdentity(rx_packet.senderpubkey)
+                    anon.create_shared_secret(self.me.private_key)
+                    self.ids.add_identity(anon)
+                    logger.info(
+                        "Learned sender pubkey from ANON_REQ for decrypt cache: %s",
+                        hexlify(rx_packet.senderpubkey).decode(),
+                    )
+                except Exception as e:
+                    logger.debug("Unable to cache sender pubkey from ANON_REQ: %r", e)
+
         if rx_packet.snr:
             snr = int(rx_packet.snr * 4) & 0xff
         else:
@@ -305,6 +334,9 @@ class CompanionRadio(BasicMesh):
 
         logger.info(f"Pushing advert notification for {hexlify(rx_packet.advert.identity).decode()}")
         await self.appinterface.tx(msg)
+
+        # Some newer clients subscribe to PUSH_CODE_NEW_ADVERT for discovery updates.
+        await self.appinterface.tx(bytes([PUSH_CODE_NEW_ADVERT]) + rx_packet.advert.identity)
 
     async def push_new_message_waiting(self):
         """
@@ -446,40 +478,109 @@ class CompanionRadio(BasicMesh):
         #   lat (4 bytes, int32, millionths; optional)
         #   lon (4 bytes, int32, millionths; optional)
 
+        if len(contactdata) < 35:
+            logger.warning("CMD_ADD_UPDATE_CONTACT frame too short: %d bytes", len(contactdata))
+            return ERR(ERR_CODE_ILLEGAL_ARG)
+
         pubkey = contactdata[0:32]
         type = contactdata[32]
         flags = contactdata[33]
         pathlen = contactdata[34]
 
-        # If pathlen is 0 (ie, direct, zero-hop), path will be [] (as a bytes object, ie b'')
-        path = contactdata[35:35+pathlen]
+        # Legacy app format may send pathlen=0xFF with a fixed 64-byte path field.
+        if pathlen == 0xFF:
+            if len(contactdata) < 35 + 64:
+                logger.warning(
+                    "CMD_ADD_UPDATE_CONTACT truncated legacy path field: len=%d",
+                    len(contactdata),
+                )
+                return ERR(ERR_CODE_ILLEGAL_ARG)
+            raw_path = contactdata[35:99]
+            # In legacy mode, all-zero path means flood/unknown route.
+            path = None if raw_path == bytes(64) else raw_path.rstrip(b"\x00")
+            rest = contactdata[99:]
+        else:
+            if pathlen > 64:
+                logger.warning("CMD_ADD_UPDATE_CONTACT invalid path length: %d", pathlen)
+                return ERR(ERR_CODE_ILLEGAL_ARG)
 
-        rest = contactdata[35+pathlen:]
-        name = rest[0:32].rstrip(b'\x00')
-        last_advert_time = struct.unpack("<L", rest[32:36])[0]
+            if len(contactdata) < 35 + pathlen:
+                logger.warning(
+                    "CMD_ADD_UPDATE_CONTACT truncated path: len=%d pathlen=%d",
+                    len(contactdata),
+                    pathlen,
+                )
+                return ERR(ERR_CODE_ILLEGAL_ARG)
 
+            # If pathlen is 0 (ie, direct, zero-hop), path will be [] (as bytes b'').
+            path = contactdata[35:35+pathlen]
+            rest = contactdata[35+pathlen:]
+        if len(rest) >= 32:
+            name = rest[0:32].rstrip(b'\x00')
+        else:
+            name = b''
+
+        if len(rest) >= 36:
+            last_advert_time = struct.unpack("<L", rest[32:36])[0]
+        else:
+            last_advert_time = 0
+
+        latlon = None
         if len(rest) >= 44:
             lat = struct.unpack("<l", rest[36:40])[0] / 1000000.0
             lon = struct.unpack("<l", rest[40:44])[0] / 1000000.0
             latlon = (lat, lon)
 
+        # Build a synthetic advert so contacts added by companion command can be
+        # stored in the normal IdentityStore and used for encryption/path handling.
+        adv_flags = flags & 0xF0
+        if name:
+            adv_flags |= AdvertDataFlags.NAME.value
+        if latlon is not None:
+            adv_flags |= AdvertDataFlags.LATLON.value
+
+        advert_payload = bytes([(type & 0x0F) | adv_flags])
+        if latlon is not None:
+            advert_payload += struct.pack(
+                "<ll",
+                int(latlon[0] * 1000000),
+                int(latlon[1] * 1000000),
+            )
+        if name:
+            advert_payload += name
+
+        advert_timestamp = last_advert_time if last_advert_time > 0 else int(time.time())
+        advert_data = pubkey + struct.pack("<L", advert_timestamp) + bytes(64) + advert_payload
+
+        try:
+            updated_contact = Identity(AdvertData(advert_data), path=path)
+            updated_contact.create_shared_secret(self.me.private_key)
+        except Exception as e:
+            logger.warning("CMD_ADD_UPDATE_CONTACT rejected malformed advert data: %r", e)
+            return ERR(ERR_CODE_ILLEGAL_ARG)
+
         contact = self.ids.find_by_pubkey(pubkey)
         if contact is None:
             # New contact
-            logger.error(f"Contact {hexlify(pubkey).decode()} not found")
-            return ERR(ERR_CODE_NOT_FOUND)
-            # FIXME, need to add contacts
+            self.ids.add_identity(updated_contact)
+            logger.info(
+                "Added contact %s (%s)",
+                updated_contact.name,
+                hexlify(updated_contact.pubkey).decode(),
+            )
         else:
-            # Update existing contact
-            # This command is used for various things, including updating the path for a contact,
-            # which is the only thing we're supporting right now
-            # FIXME: do the rest of it too
+            # Preserve runtime message metadata while replacing identity payload.
+            updated_contact.lastmsgtime = contact.lastmsgtime
+            updated_contact.snr = contact.snr
+            updated_contact.rssi = contact.rssi
 
-            contact.path = path
-            # Update the contact in the store
-            self.ids.add_identity(contact)
+            self.ids.add_identity(updated_contact)
 
-            logger.info(f"Updated contact {contact.name} ({hexlify(contact.pubkey).decode()})")
+            logger.info(
+                "Updated contact %s (%s)",
+                updated_contact.name,
+                hexlify(updated_contact.pubkey).decode(),
+            )
 
         return OK
 
@@ -603,6 +704,28 @@ class CompanionRadio(BasicMesh):
         await self.transmit_packet(telemetry_req)
         return sent_resp(telemetry_req, struct.pack("<L", telemetry_req.timestamp))
 
+    # Send path discovery request to repeater/sensor style targets.
+    # This is implemented as a flooded telemetry request so the response returns
+    # a PATH and refreshes route/path quality data in the mesh.
+    async def send_path_discovery_req(self, pubkey):
+        dest = self.ids.find_by_pubkey(pubkey)
+        if dest is None:
+            return ERR(ERR_CODE_NOT_FOUND)
+
+        # Keep request envelope compatible with other request commands.
+        data = bytes(4) + randbytes(4)
+
+        discovery_req = packet.MC_Req_Out(self.me, dest, packet.MC_Packet.REQ_TYPE_GET_TELEMETRY_DATA, data)
+        discovery_req.flood()
+
+        # Track this as both discovery and telemetry, so existing telemetry
+        # push handling returns the eventual response to the app.
+        self.pending_discovery = dest.pubkey
+        self.pending_telemetry = dest.pubkey
+
+        await self.transmit_packet(discovery_req)
+        return sent_resp(discovery_req, struct.pack("<L", discovery_req.timestamp))
+
 
     async def rx_response(self, packet:packet.MC_SrcDest):
         # Packet is either a MC_Response or an MC_Path. Either will contain a
@@ -688,16 +811,51 @@ class CompanionRadio(BasicMesh):
             logger.warning(f"Invalid trace request: {e}")
             return ERR(ERR_CODE_ILLEGAL_ARG)
 
+        logger.info(
+            "Trace send: tag=%s flags=0x%02x hops=%d path=%s",
+            hexlify(tag).decode(),
+            flags,
+            len(path),
+            pathstr(path),
+        )
+
         await self.transmit_packet(trace)
 
         return sent_resp(trace, tag)
 
     # Return the results of a trace to the app
     async def rx_trace(self, rx_packet:packet.MC_Trace):
-        logger.debug(f"Received Trace, tag {hexlify(rx_packet.tag).decode()}, {len(rx_packet.tracepath)} hops, {len(rx_packet.path)} results")
+        tag = hexlify(rx_packet.tag).decode()
+        logger.debug(
+            "Received Trace: tag=%s hops=%d results=%d tracepath=%s result_bytes=%s",
+            tag,
+            len(rx_packet.tracepath),
+            len(rx_packet.path),
+            pathstr(rx_packet.tracepath),
+            hexlify(rx_packet.path).decode(),
+        )
 
-        if len(rx_packet.tracepath) != len(rx_packet.path):
-            logger.debug("Incomplete trace, ignoring")
+        # If this node is the next and final hop, we can complete the trace
+        # locally instead of relying on an extra RF retransmit to bounce it back.
+        completed_path = rx_packet.path
+        if len(rx_packet.tracepath) == len(rx_packet.path) + 1:
+            snr_qdb = int(rx_packet.snr * 4) & 0xff
+            completed_path = rx_packet.path + bytes([snr_qdb])
+            logger.info(
+                "Trace local final-hop completion: tag=%s hops=%d next_hop=0x%02x final_snr_qdb=%d",
+                tag,
+                len(completed_path),
+                rx_packet.tracepath[len(rx_packet.path)],
+                snr_qdb,
+            )
+
+        if len(rx_packet.tracepath) != len(completed_path):
+            logger.debug(
+                "Incomplete trace ignored: tag=%s expected_results=%d got=%d",
+                tag,
+                len(rx_packet.tracepath),
+                len(completed_path),
+            )
             return
 
         # Completed trace has been received. Send a message to the client:
@@ -714,14 +872,21 @@ class CompanionRadio(BasicMesh):
         # It's possible this is someone else's trace. In which case, the tag won't match and the client
         # should discard it
 
-        msg = bytes([PUSH_CODE_TRACE_DATA, 0, len(rx_packet.path), rx_packet.flags]) + rx_packet.tag + rx_packet.auth
+        msg = bytes([PUSH_CODE_TRACE_DATA, 0, len(completed_path), rx_packet.flags]) + rx_packet.tag + rx_packet.auth
 
         # Path hashes
         msg += rx_packet.tracepath
         # Path SNR values (strored in the packet path) have already converted to signed byte * 4
-        msg += rx_packet.path
+        msg += completed_path
         # Final SNR for the packet we received
         msg += bytes([int(rx_packet.snr * 4) & 0xff])
+
+        logger.info(
+            "Trace complete: tag=%s hops=%d final_snr_qdb=%d",
+            tag,
+            len(completed_path),
+            int(rx_packet.snr * 4) & 0xff,
+        )
 
         await self.appinterface.tx(msg)
 
@@ -1110,7 +1275,13 @@ class CompanionRadio(BasicMesh):
                     flags = frame[9]
                     path = frame[10:]
 
-                    logger.debug(f"CMD_SEND_TRACE_PATH: tag=0x{hexlify(tag).decode()}, auth=0x{hexlify(auth).decode()}, flags={flags}, path={pathstr(path)}")
+                    logger.info(
+                        "CMD_SEND_TRACE_PATH received: tag=0x%s auth=0x%s flags=%d path=%s",
+                        hexlify(tag).decode(),
+                        hexlify(auth).decode(),
+                        flags,
+                        pathstr(path),
+                    )
 
                     response = await self.send_trace(tag, auth, flags, path)
 
@@ -1127,6 +1298,37 @@ class CompanionRadio(BasicMesh):
                 else:
                     logger.debug(f"Contact found: {contact.name}, advert path = {pathstr(contact.advertpath)}")
                     response = struct.pack("<BLB", RESP_CODE_ADVERT_PATH, contact.rxtime, len(contact.advertpath)) + bytes(contact.advertpath)
+
+            elif command == CMD_SEND_PATH_DISCOVERY_REQ:
+                # 0x34 in upstream protocol.
+                # frame[1] is reserved (normally 0), followed by target pubkey.
+                if len(frame) < 34:
+                    logger.warning("CMD_SEND_PATH_DISCOVERY_REQ frame too short: %d", len(frame))
+                    response = ERR(ERR_CODE_ILLEGAL_ARG)
+                else:
+                    key = frame[2:34]
+                    logger.debug("CMD_SEND_PATH_DISCOVERY_REQ, to: %s", hexlify(key).decode())
+                    response = await self.send_path_discovery_req(key)
+
+            elif command == CMD_DISCOVERY_FLOW:
+                mode = frame[1] if len(frame) > 1 else 0
+                logger.debug(f"CMD_DISCOVERY_FLOW mode={mode} payload={hexlify(frame[1:]).decode()}")
+                # 54 is CMD_SET_FLOOD_SCOPE_KEY in newer firmwares.
+                # Scoped flood transport is not implemented in this project yet,
+                # so we acknowledge for compatibility.
+                response = OK
+
+            elif command == CMD_REPEATER_FLOW:
+                logger.debug(f"CMD_REPEATER_FLOW payload={hexlify(frame[1:]).decode()}")
+                # Keep compatibility for control/repeater flows even when payload
+                # shape differs between app versions.
+                # Respond like mesh send commands so clients can continue repeater
+                # workflows expecting RESP_CODE_SENT + tag.
+                if len(frame) >= 5:
+                    tag = frame[-4:]
+                    response = bytes([RESP_CODE_SENT, 0]) + tag + struct.pack("<L", 10000)
+                else:
+                    response = OK
 
             else:
                 logger.warning(f"Unknown command: {command}")

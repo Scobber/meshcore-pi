@@ -143,6 +143,10 @@ class CLIDevice(BasicMesh):
 
         id = Identity(rx_packet.advert, advertpath=rx_packet.path)
         id.snr = rx_packet.snr
+        id.rssi = rx_packet.rssi
+        # Path signal params are carried in advert path bytes for multi-hop adverts.
+        # Zero-hop adverts have no hop bytes, but keep the field for consistent output.
+        id.path_signal_params = bytes(rx_packet.path)
 
         # Don't need to bother with a shared secret, we won't be sending anything to this identity
 
@@ -186,7 +190,30 @@ class CLIDevice(BasicMesh):
         Return the zero-hop neighbour list.
         Neighbours are only populated from zero-hop repeater adverts.
         """
-        return self.neighbours()
+        neighbours = self.neighbour_ids.get_all()
+        now = int(time.time())
+
+        rows = []
+        for n in neighbours:
+            age = now - n.rxtime
+            snr_qdb = int(round((n.snr or 0) * 4))
+            rssi_dbm = int(round(n.rssi or 0))
+            pathsig = hexlify(getattr(n, 'path_signal_params', b'')).decode()
+            rows.append((age, n.pubkey[0:4], snr_qdb, rssi_dbm, pathsig))
+
+        if not rows:
+            return "-none-"
+
+        response = ""
+        for idx, row in enumerate(sorted(rows)):
+            if idx > 0:
+                response += "\n"
+            response += f"{hexlify(row[1]).decode()}:{row[0]}:{row[2]}:{row[3]}:{row[4]}"
+
+            if idx > 6:
+                break
+
+        return response
 
     # Settings exposed by repeater/CLI admin options
     _admin_setting_specs = {
@@ -399,14 +426,28 @@ class CLIDevice(BasicMesh):
         ])
 
     def _noise_floor_dbm(self):
-        # Use hardware-provided reading if available, else configured/fallback value.
+        # Prefer radio-interface measurements when available.
+        for iface in self.dispatch.interfaces:
+            provider = getattr(iface, 'noisefloordbm', None)
+            if not callable(provider):
+                continue
+            try:
+                value = int(provider())
+                break
+            except Exception:
+                value = None
+        else:
+            value = None
+
+        # Fall back to hardware provider if interface does not supply it.
         provider = getattr(self.hardware, 'noisefloordbm', None)
-        if callable(provider):
+        if value is None and callable(provider):
             try:
                 value = int(provider())
             except Exception:
                 value = int(self.config.get('telemetry.noise_floor_dbm', self.config.get('radio.noise_floor_dbm', -120)))
-        else:
+
+        if value is None:
             value = int(self.config.get('telemetry.noise_floor_dbm', self.config.get('radio.noise_floor_dbm', -120)))
 
         if value < -32768:

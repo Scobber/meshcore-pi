@@ -146,9 +146,13 @@ class CompanionInterface(BaseCompanionInterface):
         logger.debug(f"Connection callback - client has connected from {addr}")
 
         if self._writer is not None:
-            logger.info("Client already connected, disconnecting")
-            writer.close()
-            return
+            logger.info("Client already connected, replacing old session")
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+            self._connected.clear()
 
         self._reader = reader
         self._writer = writer

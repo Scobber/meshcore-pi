@@ -217,6 +217,8 @@ class Destination:
 
         # Signal-to-noise ratio (for repeater neighbour data)
         self.snr = None
+        # Last RSSI (for repeater neighbour data)
+        self.rssi = None
 
     @property
     def sharedsecret(self):
@@ -518,7 +520,26 @@ class FileIdentityStore(IdentityStore):
                 for line in f:
                     if line.startswith('#'):
                         continue
-                    snr = line.rstrip().split(':')
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Anonymous identities are persisted as:
+                    #   anon:<hex pubkey>
+                    if line.startswith('anon:'):
+                        try:
+                            pubkey = unhexlify(line[5:])
+                            if len(pubkey) != 32:
+                                logger.warning("Ignoring invalid anon identity length in %s", filename)
+                                continue
+                            id = AnonIdentity(pubkey)
+                            id.create_shared_secret(selfidentity)
+                            super().add_identity(id)
+                        except Exception as e:
+                            logger.warning("Ignoring malformed anon identity in %s: %r", filename, e)
+                        continue
+
+                    snr = line.split(':')
                     since = snr[0].rstrip().split('@')
                     fields = since[0].rstrip().split('/')
                     data = unhexlify(fields[0])
@@ -548,7 +569,9 @@ class FileIdentityStore(IdentityStore):
             print("# Stored adverts for contacts", file=f)
             for id in self.get_all():
                 if isinstance(id, AnonIdentity):
-                    # Skip anon
+                    # Persist anonymous sender identities so shared-secret cache
+                    # survives restarts and decryption remains stable.
+                    print(f"anon:{hexlify(id.pubkey).decode('utf-8')}", file=f)
                     continue
                 # Only writing advertised identities to file
                 print('#', id.name, file=f)

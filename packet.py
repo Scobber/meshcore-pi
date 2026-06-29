@@ -284,7 +284,7 @@ class MC_Incoming(MC_Packet):
             # Split the packet into header, path, and payload
             self.header = packet[0]
             pathlen = packet[1]
-            if pathlen > 63 or pathlen > (len(packet)-2):
+            if pathlen > self.MAX_PATH_SIZE or pathlen > (len(packet)-2):
                 raise InvalidMeshcorePacket("Path length too long")
             
             self.path = bytearray(packet[2:2 + pathlen])
@@ -400,7 +400,7 @@ class MC_Outgoing(MC_Packet):
                 self.path = path
             else:
                 raise ValueError("Path must be bytes or bytearray")
-            if len(path) > 63:
+            if len(path) > self.MAX_PATH_SIZE:
                 raise ValueError("Path is too long")
 
         self.header |= (type << 2) | (self.VER_1 << 6)

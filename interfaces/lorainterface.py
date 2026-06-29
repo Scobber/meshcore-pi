@@ -97,6 +97,8 @@ class LoRaInterface(Interface):
         self.txtime = 0
         self._last_status = None
         self._tx_wait_since = None
+        self._noise_floor_samples = deque(maxlen=16)
+        self._noise_floor_estimate_dbm = int(config.get("noise_floor_dbm", -120))
 
         # Fetch all the config we need
         # Default config is UK/EU Narrow
@@ -123,6 +125,7 @@ class LoRaInterface(Interface):
         self.cr = config.get("cr")
         self.txpower = config.get("txpower")
         airtime = config.get("airtime", 10)
+        self.tx_timeout_s = float(config.get("tx_timeout_s", 5.0))
         self.debug = config.get("debug", False)
 
         spi = config.get("spi")
@@ -246,6 +249,11 @@ class LoRaInterface(Interface):
         self.airtime_txtimestamp = deque([0,0,0,0,0], maxlen=5)
         self.airtime_txtime = deque([0,0,0,0,0], maxlen=5)
 
+        # SX127x on some Pi GPIO stacks can miss TX_DONE occasionally; allow one
+        # automatic retry by default. SX126x keeps retry disabled by default.
+        default_tx_retries = 1 if self.is_sx127x else 0
+        self.tx_retries = int(config.get("tx_retries", default_tx_retries))
+
         logger.debug(f"Configured {chip_name} LoRa interface on SPI{spi}:{cs} for {self.freq/1000000:0.3f}MHz, BW: {self.bw/1000}KHz, SF: {self.sf}, CR: {self.cr}")
 
     def _fallback_to_polling(self):
@@ -312,6 +320,15 @@ class LoRaInterface(Interface):
 
                 rssi = self.LoRa.packetRssi()
                 snr = self.LoRa.snr()
+
+                # Estimate noise floor from received packets: noise ~= RSSI - SNR.
+                # Keep a short rolling window so telemetry reflects current RF conditions.
+                try:
+                    noise_floor = int(round(float(rssi) - float(snr)))
+                    self._noise_floor_samples.append(noise_floor)
+                    self._noise_floor_estimate_dbm = int(sum(self._noise_floor_samples) / len(self._noise_floor_samples))
+                except Exception:
+                    pass
 
                 self.eventloop.call_soon_threadsafe(self.rx_q.put_nowait, (data,rssi,snr))
                 logger.debug(f"Packet data, {hexlify(data).decode()}")
@@ -386,39 +403,49 @@ class LoRaInterface(Interface):
 
     async def transmit(self, packetdata):
         logger.debug(f"Transmitting: {hexlify(packetdata).decode()}")
-                
-        self.txdone.clear()
-        self.txtime = 0
 
-        self.LoRa.beginPacket()
-        self.LoRa.put(packetdata)
-        try:
-            self.LoRa.endPacket()
-        except RuntimeError as e:
-            if self.is_sx127x and "edge detection" in str(e).lower():
-                self._fallback_to_polling()
+        attempts = max(1, self.tx_retries + 1)
+        for attempt in range(1, attempts + 1):
+            self.txdone.clear()
+            self.txtime = 0
+
+            self.LoRa.beginPacket()
+            self.LoRa.put(packetdata)
+            try:
                 self.LoRa.endPacket()
-            else:
-                raise
+            except RuntimeError as e:
+                if self.is_sx127x and "edge detection" in str(e).lower():
+                    self._fallback_to_polling()
+                    self.LoRa.endPacket()
+                else:
+                    raise
 
-        try:
-            await asyncio.wait_for(self.txdone.wait(), 5)
+            try:
+                await asyncio.wait_for(self.txdone.wait(), self.tx_timeout_s)
 
-            logger.debug("Transmit time: {0:0.2f} ms".format(self.txtime))
+                logger.debug("Transmit time: {0:0.2f} ms".format(self.txtime))
 
-            self.airtime_txtimestamp.append(time.time())
-            self.airtime_txtime.append(self.txtime)
+                self.airtime_txtimestamp.append(time.time())
+                self.airtime_txtime.append(self.txtime)
+                self.txdone.clear()
+                return self.txtime
 
-        except TimeoutError:
-            logger.debug("Transmit timed out")
-            # In SX127x polling mode, status can stick in TX_WAIT and leave RX stalled.
-            # Force the receiver back to continuous mode so inbound responses can be heard.
-            if self.is_sx127x and self.irq is not None and self.irq < 0:
-                try:
-                    self._request_rx_continuous()
-                except Exception as e:
-                    logger.warning(f"Failed to re-arm RX after TX timeout: {e}")
-    
+            except TimeoutError:
+                logger.warning(f"Transmit timed out (attempt {attempt}/{attempts})")
+                # SX127x can stall in TX_WAIT on some GPIO/IRQ stacks. Recover by
+                # forcing polling mode and re-arming RX_CONTINUOUS.
+                if self.is_sx127x:
+                    try:
+                        self._fallback_to_polling()
+                        self._request_rx_continuous()
+                        logger.warning("SX127x TX timeout recovery applied (polling RX re-arm)")
+                    except Exception as e:
+                        logger.warning(f"Failed to recover after TX timeout: {e}")
+
+                if attempt < attempts:
+                    await asyncio.sleep(0.05)
+                    logger.warning(f"Retrying TX (attempt {attempt + 1}/{attempts})")
+
         self.txdone.clear()
         return self.txtime
 
@@ -426,6 +453,9 @@ class LoRaInterface(Interface):
     # tx power (dBm), maximum tx power (dBm)
     def get_radioconfig(self):
         return (self.freq//1000, self.bw, self.sf, self.cr, self.txpower, self.max_txpower)
+
+    def noisefloordbm(self):
+        return self._noise_floor_estimate_dbm
 
     async def start(self):
         self.eventloop = asyncio.get_running_loop()

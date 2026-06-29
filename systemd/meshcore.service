@@ -1,0 +1,20 @@
+[Unit]
+Description=Meshcore Pi service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshcore
+Group=meshcore
+WorkingDirectory=/opt/meshcore-pi
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash /opt/meshcore-pi/meshcore-start.sh /etc/meshcore/config.toml
+Restart=on-failure
+RestartSec=5
+StateDirectory=meshcore
+CacheDirectory=meshcore
+LogsDirectory=meshcore
+
+[Install]
+WantedBy=multi-user.target

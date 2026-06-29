@@ -4,6 +4,7 @@ import asyncio
 from aiotools import TaskGroup
 
 from binascii import unhexlify, hexlify
+import os
 import sys
 import logging
 
@@ -23,7 +24,20 @@ if len(sys.argv)>1:
 
     config = configuration.get_config(configfile)
 else:
+    configfile = "config.toml"
     config = configuration.get_config()
+
+config_basedir = os.path.dirname(os.path.abspath(configfile))
+
+
+def resolve_state_path(path):
+    # Keep absolute paths as-is; resolve relative paths next to the loaded config
+    # so mutable state lives under /etc/meshcore instead of /opt runtime code.
+    if path is None:
+        return None
+    if os.path.isabs(path):
+        return path
+    return os.path.join(config_basedir, path)
 
 # Default logging configuration
 if sys.version_info >= (3,12):
@@ -145,7 +159,11 @@ for device in device_list:
     else:
         latlon = None
 
-    ids_file = data.get('contacts')
+    ids_file = resolve_state_path(data.get('contacts'))
+    if ids_file is None and device_type == "repeater":
+        # Persist repeater neighbour/discovery identities across restarts.
+        ids_file = resolve_state_path(f"{device}-contacts.mesh")
+
     if ids_file is None:
         logger.debug("No identity file configured, using memory store")
         ids = IdentityStore()
@@ -156,7 +174,7 @@ for device in device_list:
     if device_type == "companion":
         import groupchannel
         numchannels = data.get('channels', 32)
-        channelfile = data.get('channelfile')
+        channelfile = resolve_state_path(data.get('channelfile'))
         add_public = data.get('add_public_channel', True)
 
         channels = groupchannel.channels(channelfile, numchannels, add_public)

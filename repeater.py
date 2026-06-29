@@ -28,24 +28,46 @@ class Repeater(CLIDevice):
 
     # Respond to a trace
     async def rx_trace(self, rx_packet):
-        logger.debug("Trace packet")
+        tag = hexlify(rx_packet.tag).decode()
+        logger.info(
+            "Trace packet received: tag=%s trace_hops=%d collected_results=%d local_hash=0x%02x",
+            tag,
+            len(rx_packet.tracepath),
+            len(rx_packet.path),
+            self.me.hash,
+        )
 
         # Trace is 4+4+1 bytes (tag, auth, flags) plus a path
         # We only care about the path; the other bits are for the originating client
         if len(rx_packet.tracepath) == len(rx_packet.path):
             # Have reached the last hop. Repeaters don't originate traces(?), so ignore
-            logger.debug("End of trace reached. Not for us.")
+            logger.info("Trace complete at repeater boundary; not forwarding: tag=%s", tag)
         elif len(rx_packet.tracepath) < len(rx_packet.path):
             # Packet path (SNR data) is longer than trace path - something is wrong
             raise InvalidMeshcorePacket("Trace data is longer than trace path")
         else:
             currenthop = rx_packet.tracepath[len(rx_packet.path)]
-            logger.debug(f"Current hop is: {hex(currenthop)}")
+            logger.info("Trace next hop: tag=%s hop=0x%02x", tag, currenthop)
 
             if currenthop == self.me.hash:
                 # Current hop matches my pubkey hash, so this is (probably) for me
                 # Add the current packet SNR to the path
-                rx_packet.path += bytes([int(rx_packet.snr * 4) & 0xff])
+                snr_qdb = int(rx_packet.snr * 4) & 0xff
+                rx_packet.path += bytes([snr_qdb])
+                logger.info(
+                    "Trace forwarding: tag=%s appended_snr_qdb=%d new_results=%d/%d",
+                    tag,
+                    snr_qdb,
+                    len(rx_packet.path),
+                    len(rx_packet.tracepath),
+                )
                 # And resend the packet
                 current_taskgroup.get().create_task(self.transmit_packet(rx_packet))
+            else:
+                logger.info(
+                    "Trace hop mismatch, ignoring: tag=%s expected_local=0x%02x got=0x%02x",
+                    tag,
+                    self.me.hash,
+                    currenthop,
+                )
 

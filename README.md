@@ -9,6 +9,7 @@ run on a Raspberry Pi or other Linux device. It can make use of SX1262
 interfaces such as the Waveshare LoRa HAT or an HT-RA62 connected to SPI
 and GPIO, as well as SX1272-based boards such as the Dragino LoRa/GPS HAT
 v1.4.
+With the Dragino board, it needs to run on CS 2. This requires the device tree overlay to be compiled.
 
 It can also communicate over ESP-NOW with a suitable WiFi interface (one
 which can be put into "monitor" mode), and for experimenting, it can use
@@ -53,6 +54,13 @@ $ pip install pycryptodome aiotools pyserial_asyncio typing-extensions
 $ pip install LoRaRF
 $ pip install scapy==2.5.0
 ```
+
+To execute.
+```
+./meshcore.py
+```
+
+If you are on Raspbian, use ```sudo ./install.sh``` to install on the device and setup systemd.
 
 ### Using LoRa interfaces
 
